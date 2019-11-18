@@ -2,7 +2,7 @@ use raw::RawBuffer;
 
 mod raw;
 
-/// A concurrent buffer implementation based on a linked list of segments.
+/// An unbounded concurrent buffer implementation based on a linked list of segments.
 ///
 /// This type is different from a queue in that it supports either writing
 /// to the buffer in parallel xor reading from it sequentially. As a result,

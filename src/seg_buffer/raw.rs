@@ -12,9 +12,6 @@ struct Segment<T> {
     /// Pointer to the next segment in the list, or `ptr::null`
     /// if it does not exist.
     next: AtomicPtr<Segment<T>>,
-    /// Pointer to the previous segment in the list, or `ptr::null`
-    /// if it does not exist.
-    prev: AtomicPtr<Segment<T>>,
     /// Capacity of this segment.
     capacity: usize,
     /// Index of the next value to write into this
@@ -153,7 +150,6 @@ impl<T> Drop for RawBuffer<T> {
 fn new_segment<T>(capacity: usize) -> *mut Segment<T> {
     let boxed = Box::new(Segment {
         next: AtomicPtr::new(ptr::null_mut()),
-        prev: AtomicPtr::new(ptr::null_mut()),
         capacity,
         front: AtomicUsize::new(0),
         back: AtomicUsize::new(0),
