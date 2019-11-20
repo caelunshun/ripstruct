@@ -9,10 +9,9 @@ where
     where
         I: IntoParallelIterator<Item = T>,
     {
-        let mut buffer = SegBuffer::new();
-        let writer = buffer.writer();
+        let buffer = SegBuffer::new();
 
-        par_iter.into_par_iter().for_each(|x| writer.push(x));
+        par_iter.into_par_iter().for_each(|x| buffer.push(x));
 
         buffer
     }
@@ -21,9 +20,23 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     #[test]
     fn from_par_iter() {
-        let _buffer: SegBuffer<i32> = (0..1_000_000).into_par_iter().collect();
+        let mut buffer: SegBuffer<i32> = (0..1_000_000).into_par_iter().collect();
+
+        let mut results = HashSet::new();
+        for _ in 0..1_000_000 {
+            results.insert(buffer.pop().unwrap());
+        }
+
+        assert_eq!(buffer.pop(), None);
+
+        for x in 0..1_000_000 {
+            assert!(results.contains(&x));
+        }
+
+        assert_eq!(results.len(), 1_000_000);
     }
 }

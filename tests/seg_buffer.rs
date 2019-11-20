@@ -91,6 +91,7 @@ fn multi_thread() {
     }
 
     assert_eq!(buffer.pop(), None);
+    assert_eq!(results.len(), ITERATIONS / threads());
 }
 
 #[test]
