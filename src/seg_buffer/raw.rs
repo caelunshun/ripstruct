@@ -6,6 +6,8 @@ use std::{iter, ptr};
 
 /// Capacity of the first segment in the buffer.
 const STARTING_SIZE: usize = 64;
+/// Max capacity of a segment in the buffer.
+const MAX_SIZE: usize = 262_144;
 
 /// A segment in the buffer.
 struct Segment<T> {
@@ -98,21 +100,9 @@ impl<T> RawBuffer<T> {
                         .compare_and_swap(head as *mut _, next, Ordering::AcqRel);
                 } else {
                     // Allocate new segment.
-                    let new_segment = new_segment(head.capacity * 2);
+                    let new_segment = new_segment(min(MAX_SIZE, head.capacity * 2));
 
-                    // Traverse to the end of the list and add the new segment.
-                    let mut head = head as *mut Segment<T>;
-                    let mut next = ptr::null_mut();
-                    while !head.is_null() && {
-                        next = (&*head).next.compare_and_swap(
-                            ptr::null_mut(),
-                            new_segment,
-                            Ordering::AcqRel,
-                        );
-                        !next.is_null()
-                    } {
-                        head = next;
-                    }
+                    self.append_segment(new_segment);
                 }
             }
         };
@@ -126,10 +116,51 @@ impl<T> RawBuffer<T> {
     /// Removes a value from the start of the buffer.
     ///
     /// # Safety
-    /// Neither other pop operations nor push operations may
-    /// run in parallel with this function.
-    pub unsafe fn pop(&self) -> Option<T> {
-        unimplemented!()
+    /// Neither push operations or other pop operations may not run in parallel with this function.
+    pub unsafe fn pop(&mut self) -> Option<T> {
+        // No need for atomic operations, since we have unique access.
+        let (segment, index) = loop {
+            let segment = &mut **self.tail.get_mut();
+
+            let index = *segment.back.get_mut();
+            *segment.back.get_mut() += 1;
+
+            if index >= *segment.front.get_mut() {
+                *segment.back.get_mut() = *segment.front.get_mut();
+                return None;
+            }
+
+            if index >= segment.capacity {
+                *segment.back.get_mut() = 0;
+                *segment.front.get_mut() = 0;
+                if *self.head.get_mut() == segment as *mut _ {
+                    return None;
+                } else {
+                    *self.tail.get_mut() = *segment.next.get_mut();
+                    *segment.next.get_mut() = ptr::null_mut();
+                    self.append_segment(segment);
+                }
+            } else {
+                break (segment, index);
+            }
+        };
+
+        let ptr = (&*segment.array[index].get()).as_ptr();
+        Some(ptr::read(ptr))
+    }
+
+    unsafe fn append_segment(&self, segment: *mut Segment<T>) {
+        // Traverse to the end of the list and add the new segment.
+        let mut head = self.head.load(Ordering::Acquire);
+        let mut next = ptr::null_mut::<Segment<T>>();
+        while !head.is_null() && {
+            next = (&*head)
+                .next
+                .compare_and_swap(ptr::null_mut(), segment, Ordering::AcqRel);
+            !next.is_null()
+        } {
+            head = next;
+        }
     }
 }
 
@@ -167,12 +198,12 @@ mod tests {
 
     #[test]
     fn basic() {
-        let buffer = RawBuffer::new();
+        let mut buffer = RawBuffer::new();
 
         for i in 0..1024 {
             unsafe {
                 buffer.push(i);
-                //assert_eq!(buffer.pop_back(), Some(i));
+                assert_eq!(buffer.pop(), Some(i));
             }
         }
 
@@ -180,8 +211,8 @@ mod tests {
             unsafe { buffer.push(i) };
         }
 
-        for i in (0..65536).rev() {
-            //assert_eq!(unsafe { buffer.pop_front() }, Some(i));
+        for i in 0..65536 {
+            assert_eq!(unsafe { buffer.pop() }, Some(i));
         }
     }
 }
