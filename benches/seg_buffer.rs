@@ -126,6 +126,51 @@ fn thread_creation(c: &mut Criterion) {
     });
 }
 
+fn seg_buffer_push_pop(c: &mut Criterion) {
+    c.bench_function("seg_buffer_push_pop", |b| {
+        b.iter_batched(
+            || SegBuffer::new(),
+            |mut buffer| {
+                for x in 0..AMOUNT {
+                    buffer.push(x);
+                    assert_eq!(buffer.pop(), Some(x));
+                }
+            },
+            BatchSize::SmallInput,
+        );
+    });
+}
+
+fn seg_queue_push_pop(c: &mut Criterion) {
+    c.bench_function("seg_queue_push_pop", |b| {
+        b.iter_batched(
+            || SegQueue::new(),
+            |queue| {
+                for x in 0..AMOUNT {
+                    queue.push(x);
+                    assert_eq!(queue.pop(), Ok(x));
+                }
+            },
+            BatchSize::SmallInput,
+        );
+    });
+}
+
+fn array_queue_push_pop(c: &mut Criterion) {
+    c.bench_function("array_queue_push_pop", |b| {
+        b.iter_batched(
+            || ArrayQueue::new(AMOUNT),
+            |queue| {
+                for x in 0..AMOUNT {
+                    queue.push(x).unwrap();
+                    assert_eq!(queue.pop(), Ok(x));
+                }
+            },
+            BatchSize::SmallInput,
+        );
+    });
+}
+
 fn threads() -> usize {
     num_cpus::get()
 }
@@ -143,4 +188,10 @@ criterion_group!(
     seg_queue_push_concurrent,
     array_queue_push_concurrent,
 );
-criterion_main!(single_thread, concurrent);
+criterion_group!(
+    push_pop,
+    seg_buffer_push_pop,
+    seg_queue_push_pop,
+    array_queue_push_pop,
+);
+criterion_main!(push_pop, single_thread, concurrent);
