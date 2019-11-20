@@ -1,6 +1,7 @@
 use crossbeam::scope;
 use ripstruct::SegBuffer;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 const ITERATIONS: usize = 1_000_000;
 
@@ -103,6 +104,104 @@ fn from_iter() {
     }
 
     assert_eq!(buffer.pop(), None);
+}
+
+#[test]
+fn no_double_drop() {
+    static COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    #[derive(Debug, PartialEq)]
+    struct Dropped(usize);
+
+    impl Drop for Dropped {
+        fn drop(&mut self) {
+            COUNTER.fetch_add(self.0, Ordering::Relaxed);
+        }
+    }
+
+    let mut buffer = SegBuffer::new();
+
+    scope(|s| {
+        for _ in 0..threads() {
+            s.spawn(|_| {
+                for x in 0..ITERATIONS {
+                    buffer.push(Dropped(x));
+                }
+            });
+        }
+    })
+    .unwrap();
+
+    assert_eq!(COUNTER.load(Ordering::Relaxed), 0);
+
+    for _ in 0..ITERATIONS * threads() {
+        buffer.pop().unwrap();
+    }
+
+    assert_eq!(buffer.pop(), None);
+
+    assert_eq!(
+        COUNTER.load(Ordering::Relaxed),
+        (0..ITERATIONS).sum::<usize>() * threads()
+    );
+}
+
+#[test]
+fn iter() {
+    let mut buffer = SegBuffer::new();
+
+    for x in 0..ITERATIONS {
+        buffer.push(x);
+    }
+
+    for _ in 0..2 {
+        buffer
+            .iter()
+            .enumerate()
+            .for_each(|(i, x)| assert_eq!(i, *x));
+    }
+
+    let mut vec = vec![];
+    vec.extend(buffer.iter_slices().flatten());
+
+    vec.into_iter()
+        .enumerate()
+        .for_each(|(i, x)| assert_eq!(i, x));
+}
+
+#[test]
+fn iter_mut() {
+    let mut buffer = SegBuffer::new();
+
+    for x in 0..ITERATIONS {
+        buffer.push(x);
+    }
+
+    buffer.iter_mut().for_each(|x| *x *= 2);
+
+    buffer
+        .iter()
+        .enumerate()
+        .for_each(|(i, x)| assert_eq!(i * 2, *x));
+}
+
+#[cfg(feature = "rayon")]
+#[cfg_attr(feature = "rayon", test)]
+fn par_iter() {
+    use rayon::prelude::*;
+
+    let mut buffer = SegBuffer::new();
+
+    for x in 0..ITERATIONS {
+        buffer.push(x);
+    }
+
+    buffer.par_iter_mut().for_each(|x| *x *= 2);
+
+    buffer
+        .iter()
+        .enumerate()
+        .for_each(|(i, x)| assert_eq!(i * 2, *x));
 }
 
 fn threads() -> usize {

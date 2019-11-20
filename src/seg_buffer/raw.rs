@@ -149,6 +149,31 @@ impl<T> RawBuffer<T> {
         Some(ptr::read(ptr))
     }
 
+    /// Returns a raw iterator over segments.
+    ///
+    /// # Safety
+    /// Neither push operations or other pop operations may not run in parallel with this function.
+    pub fn iter(&mut self) -> RawIter<T> {
+        let tail = *self.tail.get_mut();
+        RawIter {
+            buffer: self,
+            segment: tail,
+        }
+    }
+
+    /// Returns a raw parallel iterator over segments.
+    ///
+    /// # Safety
+    /// Neither push operations or other pop operations may not run in parallel with this function.
+    #[cfg(feature = "rayon")]
+    pub fn par_iter(&mut self) -> ParRawIter<T> {
+        let tail = *self.tail.get_mut();
+        ParRawIter {
+            buffer: self,
+            segment: tail,
+        }
+    }
+
     unsafe fn append_segment(&self, segment: *mut Segment<T>) {
         // Traverse to the end of the list and add the new segment.
         let mut head = self.head.load(Ordering::Acquire);
@@ -190,6 +215,110 @@ fn new_segment<T>(capacity: usize) -> *mut Segment<T> {
     });
 
     Box::into_raw(boxed)
+}
+
+pub struct RawIter<'a, T> {
+    #[allow(dead_code)]
+    buffer: &'a RawBuffer<T>,
+    segment: *mut Segment<T>,
+}
+
+impl<'a, T> Iterator for RawIter<'a, T> {
+    type Item = &'a mut [T];
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let segment = unsafe { self.segment.as_mut()? };
+
+        let start = min(*segment.back.get_mut(), segment.capacity);
+        let end = min(*segment.front.get_mut(), segment.capacity);
+
+        let uninit_slice = &mut segment.array[start..end];
+
+        // Sound because both UnsafeCell and MaybeUninit are repr(transparent).
+        let slice = unsafe {
+            std::mem::transmute::<&mut [UnsafeCell<MaybeUninit<T>>], &mut [T]>(uninit_slice)
+        };
+
+        self.segment = *segment.next.get_mut();
+
+        Some(slice)
+    }
+}
+
+#[cfg(feature = "rayon")]
+pub use self::rayon::*;
+#[cfg(feature = "rayon")]
+mod rayon {
+    use crate::seg_buffer::raw::{RawBuffer, RawIter, Segment};
+    use rayon::iter::plumbing::{Consumer, Folder, UnindexedConsumer, UnindexedProducer};
+    use rayon::iter::{plumbing, ParallelIterator};
+
+    pub struct ParRawIter<'a, T> {
+        pub(super) buffer: &'a RawBuffer<T>,
+        pub(super) segment: *mut Segment<T>,
+    }
+
+    unsafe impl<'a, T> Send for ParRawIter<'a, T> where T: Send {}
+
+    impl<'a, T> ParallelIterator for ParRawIter<'a, T>
+    where
+        T: Send,
+    {
+        type Item = &'a mut [T];
+
+        fn drive_unindexed<C>(self, consumer: C) -> <C as Consumer<Self::Item>>::Result
+        where
+            C: UnindexedConsumer<Self::Item>,
+        {
+            plumbing::bridge_unindexed(self, consumer)
+        }
+    }
+
+    impl<'a, T> ParRawIter<'a, T> {
+        pub fn slice(&self) -> &'a mut [T] {
+            RawIter {
+                segment: self.segment,
+                buffer: self.buffer,
+            }
+            .next()
+            .unwrap()
+        }
+    }
+
+    impl<'a, T> UnindexedProducer for ParRawIter<'a, T>
+    where
+        T: Send,
+    {
+        type Item = &'a mut [T];
+
+        fn split(self) -> (Self, Option<Self>) {
+            let next = unsafe {
+                let ptr = *(&mut *self.segment).next.get_mut();
+                ptr.as_mut()
+            };
+
+            let buffer = self.buffer;
+            match next {
+                Some(next) => (
+                    self,
+                    Some(Self {
+                        buffer,
+                        segment: next as *mut _,
+                    }),
+                ),
+                None => (self, None),
+            }
+        }
+
+        fn fold_with<F>(self, folder: F) -> F
+        where
+            F: Folder<Self::Item>,
+        {
+            let slice = self.slice();
+
+            folder.consume(slice)
+        }
+    }
 }
 
 #[cfg(test)]
