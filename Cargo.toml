@@ -5,6 +5,10 @@ authors = ["caelunshun <caelunshun@gmail.com>"]
 edition = "2018"
 
 [dependencies]
+crossbeam-epoch = "0.8"
+arrayvec = "0.5"
+ahash = "0.2"
+bitintr = "0.3"
 
 [dev-dependencies]
 criterion = "0.3"
