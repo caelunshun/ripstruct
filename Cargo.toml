@@ -9,6 +9,8 @@ crossbeam-epoch = "0.8"
 arrayvec = "0.5"
 ahash = "0.2"
 bitintr = "0.3"
+rayon = { version = "1.2", optional = true }
+
 
 [dev-dependencies]
 criterion = "0.3"

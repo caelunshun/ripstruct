@@ -6,6 +6,8 @@ use std::{iter, ptr};
 
 /// Capacity of the first segment in the buffer.
 const STARTING_SIZE: usize = 64;
+/// Max capacity of a segment in the buffer.
+const MAX_SIZE: usize = 262_144;
 
 /// A segment in the buffer.
 struct Segment<T> {
@@ -98,21 +100,9 @@ impl<T> RawBuffer<T> {
                         .compare_and_swap(head as *mut _, next, Ordering::AcqRel);
                 } else {
                     // Allocate new segment.
-                    let new_segment = new_segment(head.capacity * 2);
+                    let new_segment = new_segment(min(MAX_SIZE, head.capacity * 2));
 
-                    // Traverse to the end of the list and add the new segment.
-                    let mut head = head as *mut Segment<T>;
-                    let mut next = ptr::null_mut();
-                    while !head.is_null() && {
-                        next = (&*head).next.compare_and_swap(
-                            ptr::null_mut(),
-                            new_segment,
-                            Ordering::AcqRel,
-                        );
-                        !next.is_null()
-                    } {
-                        head = next;
-                    }
+                    self.append_segment(new_segment);
                 }
             }
         };
@@ -126,10 +116,76 @@ impl<T> RawBuffer<T> {
     /// Removes a value from the start of the buffer.
     ///
     /// # Safety
-    /// Neither other pop operations nor push operations may
-    /// run in parallel with this function.
-    pub unsafe fn pop(&self) -> Option<T> {
-        unimplemented!()
+    /// Neither push operations or other pop operations may not run in parallel with this function.
+    pub unsafe fn pop(&mut self) -> Option<T> {
+        // No need for atomic operations, since we have unique access.
+        let (segment, index) = loop {
+            let segment = &mut **self.tail.get_mut();
+
+            let index = *segment.back.get_mut();
+            *segment.back.get_mut() += 1;
+
+            if index >= *segment.front.get_mut() {
+                *segment.back.get_mut() = *segment.front.get_mut();
+                return None;
+            }
+
+            if index >= segment.capacity {
+                *segment.back.get_mut() = 0;
+                *segment.front.get_mut() = 0;
+                if *self.head.get_mut() == segment as *mut _ {
+                    return None;
+                } else {
+                    *self.tail.get_mut() = *segment.next.get_mut();
+                    *segment.next.get_mut() = ptr::null_mut();
+                    self.append_segment(segment);
+                }
+            } else {
+                break (segment, index);
+            }
+        };
+
+        let ptr = (&*segment.array[index].get()).as_ptr();
+        Some(ptr::read(ptr))
+    }
+
+    /// Returns a raw iterator over segments.
+    ///
+    /// # Safety
+    /// Neither push operations or other pop operations may not run in parallel with this function.
+    pub fn iter(&mut self) -> RawIter<T> {
+        let tail = *self.tail.get_mut();
+        RawIter {
+            buffer: self,
+            segment: tail,
+        }
+    }
+
+    /// Returns a raw parallel iterator over segments.
+    ///
+    /// # Safety
+    /// Neither push operations or other pop operations may not run in parallel with this function.
+    #[cfg(feature = "rayon")]
+    pub fn par_iter(&mut self) -> ParRawIter<T> {
+        let tail = *self.tail.get_mut();
+        ParRawIter {
+            buffer: self,
+            segment: tail,
+        }
+    }
+
+    unsafe fn append_segment(&self, segment: *mut Segment<T>) {
+        // Traverse to the end of the list and add the new segment.
+        let mut head = self.head.load(Ordering::Acquire);
+        let mut next = ptr::null_mut::<Segment<T>>();
+        while !head.is_null() && {
+            next = (&*head)
+                .next
+                .compare_and_swap(ptr::null_mut(), segment, Ordering::AcqRel);
+            !next.is_null()
+        } {
+            head = next;
+        }
     }
 }
 
@@ -161,18 +217,122 @@ fn new_segment<T>(capacity: usize) -> *mut Segment<T> {
     Box::into_raw(boxed)
 }
 
+pub struct RawIter<'a, T> {
+    #[allow(dead_code)]
+    buffer: &'a RawBuffer<T>,
+    segment: *mut Segment<T>,
+}
+
+impl<'a, T> Iterator for RawIter<'a, T> {
+    type Item = &'a mut [T];
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let segment = unsafe { self.segment.as_mut()? };
+
+        let start = min(*segment.back.get_mut(), segment.capacity);
+        let end = min(*segment.front.get_mut(), segment.capacity);
+
+        let uninit_slice = &mut segment.array[start..end];
+
+        // Sound because both UnsafeCell and MaybeUninit are repr(transparent).
+        let slice = unsafe {
+            std::mem::transmute::<&mut [UnsafeCell<MaybeUninit<T>>], &mut [T]>(uninit_slice)
+        };
+
+        self.segment = *segment.next.get_mut();
+
+        Some(slice)
+    }
+}
+
+#[cfg(feature = "rayon")]
+pub use self::rayon::*;
+#[cfg(feature = "rayon")]
+mod rayon {
+    use crate::seg_buffer::raw::{RawBuffer, RawIter, Segment};
+    use rayon::iter::plumbing::{Consumer, Folder, UnindexedConsumer, UnindexedProducer};
+    use rayon::iter::{plumbing, ParallelIterator};
+
+    pub struct ParRawIter<'a, T> {
+        pub(super) buffer: &'a RawBuffer<T>,
+        pub(super) segment: *mut Segment<T>,
+    }
+
+    unsafe impl<'a, T> Send for ParRawIter<'a, T> where T: Send {}
+
+    impl<'a, T> ParallelIterator for ParRawIter<'a, T>
+    where
+        T: Send,
+    {
+        type Item = &'a mut [T];
+
+        fn drive_unindexed<C>(self, consumer: C) -> <C as Consumer<Self::Item>>::Result
+        where
+            C: UnindexedConsumer<Self::Item>,
+        {
+            plumbing::bridge_unindexed(self, consumer)
+        }
+    }
+
+    impl<'a, T> ParRawIter<'a, T> {
+        pub fn slice(&self) -> &'a mut [T] {
+            RawIter {
+                segment: self.segment,
+                buffer: self.buffer,
+            }
+            .next()
+            .unwrap()
+        }
+    }
+
+    impl<'a, T> UnindexedProducer for ParRawIter<'a, T>
+    where
+        T: Send,
+    {
+        type Item = &'a mut [T];
+
+        fn split(self) -> (Self, Option<Self>) {
+            let next = unsafe {
+                let ptr = *(&mut *self.segment).next.get_mut();
+                ptr.as_mut()
+            };
+
+            let buffer = self.buffer;
+            match next {
+                Some(next) => (
+                    self,
+                    Some(Self {
+                        buffer,
+                        segment: next as *mut _,
+                    }),
+                ),
+                None => (self, None),
+            }
+        }
+
+        fn fold_with<F>(self, folder: F) -> F
+        where
+            F: Folder<Self::Item>,
+        {
+            let slice = self.slice();
+
+            folder.consume(slice)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn basic() {
-        let buffer = RawBuffer::new();
+        let mut buffer = RawBuffer::new();
 
         for i in 0..1024 {
             unsafe {
                 buffer.push(i);
-                //assert_eq!(buffer.pop_back(), Some(i));
+                assert_eq!(buffer.pop(), Some(i));
             }
         }
 
@@ -180,8 +340,8 @@ mod tests {
             unsafe { buffer.push(i) };
         }
 
-        for i in (0..65536).rev() {
-            //assert_eq!(unsafe { buffer.pop_front() }, Some(i));
+        for i in 0..65536 {
+            assert_eq!(unsafe { buffer.pop() }, Some(i));
         }
     }
 }
